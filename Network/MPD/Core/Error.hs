@@ -12,22 +12,28 @@ import Control.Monad.Error (Error(..))
 
 -- | The MPDError type is used to signal errors, both from the MPD and
 -- otherwise.
-data MPDError = NoMPD              -- ^ MPD not responding
+data MPDError = NoMPD              -- ^ No active connection to MPD
+              | ConnError String   -- ^ Error while connecting to MPD
+              | ConnLost String    -- ^ Current connection is no longer valid
               | TimedOut           -- ^ The connection timed out
               | Unexpected String  -- ^ MPD returned an unexpected response.
                                    --   This is a bug, either in the library or
                                    --   in MPD itself.
               | Custom String      -- ^ Used for misc. errors
-              | ACK ACKType String -- ^ ACK type and a message from the
-                                   --   server
-                deriving Eq
+              | ACK {
+                  ackType :: ACKType -- ^ ACK type
+                , ackCmd  :: String  -- ^ command that failed
+                , ackMsg  :: String  -- ^ message from the server
+                } deriving Eq
 
 instance Show MPDError where
-    show NoMPD          = "Could not connect to MPD"
+    show NoMPD          = "No active connection"
+    show (ConnError s)  = "Could not connect to MPD: " ++ s
+    show (ConnLost s)   = "Connection to MPD lost: " ++ s
     show TimedOut       = "MPD connection timed out"
     show (Unexpected s) = "MPD returned an unexpected response: " ++ s
     show (Custom s)     = s
-    show (ACK _ s)      = s
+    show ack            = ackCmd ack ++ ": " ++ ackMsg ack
 
 instance Error MPDError where
     noMsg  = Custom "An error occurred"

@@ -13,36 +13,30 @@ module Network.MPD.Core (
     -- * Classes
     MonadMPD(..),
     -- * Data types
-    MPD, MPDError(..), ACKType(..), Response, Host, Port, Password,
+    MPD(..), MPDError(..), ACKType(..), Response,
     -- * Running
     withMPDEx,
     -- * Interacting
-    getResponse, kill,
+    kill, parseAck, stHandle
     ) where
 
 import Network.MPD.Utils
 import Network.MPD.Core.Class
 import Network.MPD.Core.Error
 
+import qualified Data.ByteString.Char8 as B
 import Data.Char (isDigit)
-import Control.Applicative (Applicative(..), (<$>))
+import Data.Maybe (fromMaybe)
+import Control.Applicative (Applicative(..))
+import Control.Exception (try)
 import Control.Monad (ap, unless)
 import Control.Monad.Error (ErrorT(..), MonadError(..))
 import Control.Monad.Reader (ReaderT(..), ask)
 import Control.Monad.State (StateT, MonadIO(..), modify, get, evalStateT)
 import qualified Data.Foldable as F
-import Data.List (isPrefixOf)
 import Network (PortID(..), withSocketsDo, connectTo)
-import System.IO (Handle, hPutStrLn, hReady, hClose, hFlush)
-import System.IO.Error (isEOFError)
-import qualified System.IO.UTF8 as U
-
---
--- Data types.
---
-
-type Host = String
-type Port = Integer
+import System.IO (Handle, hPutStrLn, hClose, hFlush)
+import System.IO.Unsafe (unsafeInterleaveIO)
 
 --
 -- IO based MPD client implementation.
@@ -62,7 +56,7 @@ type Port = Integer
 newtype MPD a =
     MPD { runMPD :: ErrorT MPDError
                     (StateT MPDState
-                     (ReaderT (Host, Port) IO)) a
+                     (ReaderT (String, Int) IO)) a
         } deriving (Functor, Monad, MonadIO, MonadError MPDError)
 
 instance Applicative MPD where
@@ -73,6 +67,7 @@ instance MonadMPD MPD where
     open  = mpdOpen
     close = mpdClose
     send  = mpdSend
+    receive = mpdReceive
     getHandle = MPD $ get >>= return . stHandle
     getPassword = MPD $ get >>= return . stPassword
     setPassword pw = MPD $ modify (\st -> st { stPassword = pw })
@@ -89,30 +84,31 @@ data MPDState =
 type Response = Either MPDError
 
 -- | The most configurable API for running an MPD action.
-withMPDEx :: Host -> Port -> Password -> MPD a -> IO (Response a)
+withMPDEx :: String -> Int -> String -> MPD a -> IO (Response a)
 withMPDEx host port pw x = withSocketsDo $
     runReaderT (evalStateT (runErrorT . runMPD $ open >> x) initState)
                (host, port)
-                   where initState = MPDState Nothing pw (0, 0, 0)
+    where
+          initState = MPDState Nothing pw (0, 0, 0)
 
 mpdOpen :: MPD ()
 mpdOpen = MPD $ do
     (host, port) <- ask
     runMPD close
-    handle <- liftIO (safeConnectTo host port)
-    modify (\st -> st { stHandle = handle })
-    F.forM_ handle (const $ runMPD checkConn >>= flip unless (runMPD close))
+    tryIO (connectToMPD host port)
+          (throwError . ConnError . show)
+          (\handle -> modify (\st -> st { stHandle = Just handle }))
+    runMPD checkConn >>= flip unless
+        (runMPD close >> throwError (ConnError "Validation failed"))
     where
-        safeConnectTo host@('/':_) _ =
-            (Just <$> connectTo "" (UnixSocket host))
-            `catch` const (return Nothing)
-        safeConnectTo host port =
-            (Just <$> connectTo host (PortNumber $ fromInteger port))
-            `catch` const (return Nothing)
+        connectToMPD host@('/':_) _ =
+            connectTo "" (UnixSocket host)
+        connectToMPD host port =
+            connectTo host (PortNumber $ fromIntegral port)
 
         checkConn = do
-            [msg] <- lines <$> send ""
-            if isPrefixOf "OK MPD" msg
+            msg <- mpdReceive >>= checkMsg
+            if B.pack "OK MPD" `B.isPrefixOf` msg
                then do
                    MPD $ maybe (throwError $ Custom "Couldn't determine MPD version")
                                (\v -> modify (\st -> st { stVersion = v }))
@@ -120,84 +116,66 @@ mpdOpen = MPD $ do
                    return True
                else return False
 
-        parseVersion = parseTriple '.' parseNum . dropWhile (not . isDigit)
+        checkMsg ls =
+            if null ls
+               then throwError $ Custom "No welcome message"
+               else return $ head ls
+
+        parseVersion = parseTriple '.' parseInt . B.dropWhile (not . isDigit)
 
 mpdClose :: MPD ()
-mpdClose =
-    MPD $ do
-        get >>= F.mapM_ (liftIO . sendClose) . stHandle
+mpdClose = MPD $
+    get >>= F.mapM_ (\handle -> do
+        liftIO $ hClose handle
         modify (\st -> st { stHandle = Nothing })
+    ) . stHandle
+
+mpdSend :: String -> MPD ()
+mpdSend str = MPD $
+    get >>= maybe (throwError NoMPD) (\handle ->
+        if null str
+           then return ()
+           else tryIO (hPutStrLn handle str >> hFlush handle)
+                      (\e -> runMPD close >> throwError (ConnLost $ show e))
+                      return
+    ) . stHandle
+
+mpdReceive :: MPD [B.ByteString]
+mpdReceive = MPD $
+    get >>= maybe (throwError NoMPD) (\handle ->
+        tryIO (getLines handle)
+              (\e -> runMPD close >> throwError (ConnLost $ show e))
+              (\ls -> do
+                  let l = head ls
+                  if ack `B.isPrefixOf` l
+                     then throwError . parseAck $ B.unpack l
+                     else return $ takeWhile (/= ok) ls)
+    ) . stHandle
     where
-        sendClose handle =
-            (hPutStrLn handle "close" >> hReady handle >> hClose handle)
-            `catch` whenEOF (return ())
+          getLines h = do
+              l <- B.hGetLine h
+              if ack `B.isPrefixOf` l || ok `B.isPrefixOf` l
+                 then return [l]
+                 else unsafeInterleaveIO (getLines h) >>= return . (l:)
+          
+          ack = B.pack "ACK"
+          ok  = B.pack "OK"
 
-        whenEOF result err
-            | isEOFError err = result
-            | otherwise      = ioError err
-
-mpdSend :: String -> MPD String
-mpdSend str = send' `catchError` handler
-    where
-        handler TimedOut = mpdOpen >> send'
-        handler err      = throwError err
-
-        send' = MPD $ get >>= maybe (throwError NoMPD) go . stHandle
-
-        go handle = do
-            unless (null str) $
-                liftIO $ U.hPutStrLn handle str >> hFlush handle
-            liftIO ((Right <$> getLines handle []) `catch` (return . Left))
-                >>= either (\err -> if isEOFError err then
-                                        modify (\st -> st { stHandle = Nothing })
-                                        >> throwError TimedOut
-                                      else liftIO (ioError err))
-                           return
-
-        getLines handle acc = do
-            l <- U.hGetLine handle
-            if "OK" `isPrefixOf` l || "ACK" `isPrefixOf` l
-                then return . unlines $ reverse (l:acc)
-                else getLines handle (l:acc)
-
+-- | Executes IO action and runs appropriate function depending on its result.
+tryIO :: (MonadIO m) => IO a -> (IOError -> m b) -> (a -> m b) -> m b
+tryIO f err ok = (liftIO . try $ f) >>= either err ok
 
 --
 -- Other operations.
 --
 
-ignore :: (Monad m) => m a -> m ()
-ignore x = x >> return ()
-
 -- | Kill the server. Obviously, the connection is then invalid.
 kill :: (MonadMPD m) => m ()
-kill = ignore (send "kill") `catchError` cleanup
-    where
-        cleanup e = if e == TimedOut then close else throwError e
-
--- | Send a command to the MPD server and return the result.
-getResponse :: (MonadMPD m) => String -> m [String]
-getResponse cmd = (send cmd >>= parseResponse) `catchError` sendpw
-    where
-        sendpw e@(ACK Auth _) = do
-            pw <- getPassword
-            if null pw then throwError e
-                else send ("password " ++ pw) >>= parseResponse
-                  >> send cmd >>= parseResponse
-        sendpw e =
-            throwError e
-
--- Consume response and return a Response.
-parseResponse :: (MonadError MPDError m) => String -> m [String]
-parseResponse s
-    | null xs                    = throwError $ NoMPD
-    | isPrefixOf "ACK" (head xs) = throwError $ parseAck s
-    | otherwise                  = return $ Prelude.takeWhile ("OK" /=) xs
-    where
-        xs = lines s
+kill = send "kill" >> close
 
 -- Turn MPD ACK into the corresponding 'MPDError'
 parseAck :: String -> MPDError
-parseAck s = ACK ack msg
+parseAck s = ACK ack cmd msg
     where
         ack = case code of
                 2  -> InvalidArgument
@@ -212,18 +190,16 @@ parseAck s = ACK ack msg
                 55 -> NotPlaying
                 56 -> FileExists
                 _  -> UnknownACK
-        (code, _, msg) = splitAck s
+        (code, cmd, msg) = splitAck s
 
 -- Break an ACK into (error code, current command, message).
 -- ACKs are of the form:
 -- ACK [error@command_listNum] {current_command} message_text\n
 splitAck :: String -> (Int, String, String)
-splitAck s = (read code, cmd, msg)
+splitAck s = (fromMaybe (-1) $ parseNum code, cmd, msg)
     where
         (code, notCode) = between '[' '@' s
         (cmd, notCmd)   = between '{' '}' notCode
-        msg             = drop 1 $ dropWhile (' ' ==) notCmd
-
-        -- take whatever is between 'f' and 'g'.
-        between a b xs  = let (_, y) = break (== a) xs
-                          in break (== b) (drop 1 y)
+        msg             = dropWhile (' ' ==) . drop 1 $ notCmd
+        
+        between a b     = break (== b) . drop 1 . dropWhile (/= a)

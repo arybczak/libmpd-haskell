@@ -1,4 +1,4 @@
-{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE Rank2Types #-}
 
 -- | Module    : Network.MPD.Commands.Parse
 -- Copyright   : (c) Ben Sinclair 2005-2009, Joachim Fasting 2010
@@ -8,169 +8,440 @@
 --
 -- Parsers for MPD data types.
 
-module Network.MPD.Commands.Parse where
+module Network.MPD.Commands.Parse (
+    -- * Fold generator
+    parseResponse,
+    -- * Object folds
+    outputFold, subsystemFold, entryFold, directoryFold,
+    songFold, playlistFold, posPathFold, cposIdFold, decoderFold,
+    jobIdFold, stickerFold, ownedStickerFold, elementNamedFold,
+    -- * Object generators
+    genCount, genStats, genStatus,
+    -- * Misc parsers
+    genReplayGainMode
+    ) where
 
 import Network.MPD.Commands.Types
 
-import Control.Arrow ((***))
-import Control.Monad.Error
+import qualified Data.ByteString.Char8 as B
+import qualified Data.Map as M
+import Data.Maybe (fromMaybe)
+import Control.Arrow (first, (***))
+import Control.Monad (liftM)
 import Network.MPD.Utils
-import Network.MPD.Core (MonadMPD, MPDError(Unexpected))
 
--- | Builds a 'Count' instance from an assoc. list.
-parseCount :: [String] -> Either String Count
-parseCount = foldM f defaultCount . toAssocList
-        where f :: Count -> (String, String) -> Either String Count
-              f a ("songs", x)    = return $ parse parseNum
-                                    (\x' -> a { cSongs = x'}) a x
-              f a ("playtime", x) = return $ parse parseNum
-                                    (\x' -> a { cPlaytime = x' }) a x
-              f _ x               = Left $ show x
+data Iterate = Continue | Stop
 
--- | Builds a list of 'Device' instances from an assoc. list
-parseOutputs :: [String] -> Either String [Device]
-parseOutputs = mapM (foldM f defaultDevice)
-             . splitGroups [("outputid",id)]
-             . toAssocList
-    where f a ("outputid", x)      = return $ parse parseNum
-                                     (\x' -> a { dOutputID = x' }) a x
-          f a ("outputname", x)    = return a { dOutputName = x }
-          f a ("outputenabled", x) = return $ parse parseBool
-                                     (\x' -> a { dOutputEnabled = x'}) a x
-          f _ x                    = fail $ show x
+type Parser a = Maybe a -> (String, B.ByteString) -> (Maybe a, Iterate)
+type ObjFold a = (Monad m) => (a -> b -> m b) -> b -> [B.ByteString] -> m b
+type ObjGen a = (Monad m) => [B.ByteString] -> m (Maybe a)
 
--- | Builds a 'Stats' instance from an assoc. list.
-parseStats :: [String] -> Either String Stats
-parseStats = foldM f defaultStats . toAssocList
+parseResponse :: Parser a -> ObjFold a
+parseResponse parser f initial_acc ls = go Nothing ls initial_acc
     where
-        f a ("artists", x)     = return $ parse parseNum
-                                 (\x' -> a { stsArtists  = x' }) a x
-        f a ("albums", x)      = return $ parse parseNum
-                                 (\x' -> a { stsAlbums   = x' }) a x
-        f a ("songs", x)       = return $ parse parseNum
-                                 (\x' -> a { stsSongs    = x' }) a x
-        f a ("uptime", x)      = return $ parse parseNum
-                                 (\x' -> a { stsUptime   = x' }) a x
-        f a ("playtime", x)    = return $ parse parseNum
-                                 (\x' -> a { stsPlaytime = x' }) a x
-        f a ("db_playtime", x) = return $ parse parseNum
-                                 (\x' -> a { stsDbPlaytime = x' }) a x
-        f a ("db_update", x)   = return $ parse parseNum
-                                 (\x' -> a { stsDbUpdate = x' }) a x
-        f _ x = fail $ show x
+          go _   []         acc = return acc
+          go obj ls@(l:ls') acc =
+              case iter_state of
+                   Stop     -> accumulate_obj False
+                   Continue -> if null ls'
+                                  then accumulate_obj True
+                                  else go obj' ls' acc
+              where
+                    (obj', iter_state) = parser obj $ toAssoc l
+                    accumulate_obj skip =
+                        case obj' of
+                             Just x  -> f x acc >>= go Nothing (if skip
+                                                                   then ls'
+                                                                   else ls)
+                             Nothing -> go Nothing ls' acc
 
--- | Builds a 'Song' instance from an assoc. list.
-parseSong :: [(String, String)] -> Either String Song
-parseSong xs = foldM f defaultSong xs
-    where f a ("Artist", x)    = return a { sgArtist = x }
-          f a ("Album", x)     = return a { sgAlbum  = x }
-          f a ("Title", x)     = return a { sgTitle = x }
-          f a ("Genre", x)     = return a { sgGenre = x }
-          f a ("Name", x)      = return a { sgName = x }
-          f a ("Composer", x)  = return a { sgComposer = x }
-          f a ("Performer", x) = return a { sgPerformer = x }
-          f a ("Date", x)      = return $ parse parseDate
-                                 (\x' -> a { sgDate = x' }) a x
-          f a ("Track", x)     = return $ parse parseTuple
-                                 (\x' -> a { sgTrack = x'}) a x
-          f a ("Disc", x)      = return a { sgDisc = parseTuple x }
-          f a ("file", x)      = return a { sgFilePath = x }
-          f a ("Time", x)      = return $ parse parseNum
-                                 (\x' -> a { sgLength = x'}) a x
-          f a ("Id", x)        = return $ parse parseNum
-                                 (\x' -> a { sgIndex = Just x' }) a x
-          -- We prefer Id but take Pos if no Id has been found.
-          f a ("Pos", x)       =
-              maybe (return $ parse parseNum
-                           (\x' -> a { sgIndex = Just x' }) a x)
-                    (const $ return a)
-                    (sgIndex a)
-          -- Collect auxiliary keys
-          f a (k, v)           = return a { sgAux = (k, v) : sgAux a }
+-------------------------------------------------------------------
 
-          parseTuple s = let (x, y) = breakChar '/' s in
-                         -- Handle incomplete values. For example, songs might
-                         -- have a track number, without specifying the total
-                         -- number of tracks, in which case the resulting
-                         -- tuple will have two identical parts.
-                         case (parseNum x, parseNum y) of
-                             (Just x', Nothing) -> Just (x', x')
-                             (Just x', Just y') -> Just (x', y')
-                             _                  -> Nothing
+-- | Generate Output object
+genOutput :: Parser Output
+genOutput o@(Just o') (k, v) =
+    case k of
+         "outputname"    -> (Just $ o' { outName = v }, Continue)
+         "outputenabled" -> (Just $ o' { outEnabled = bool v }, Continue)
+         "outputid"      -> (o, Stop)
+         _               -> (o, Continue)
 
--- | Builds a 'Status' instance from an assoc. list.
-parseStatus :: [String] -> Either String Status
-parseStatus = foldM f defaultStatus . toAssocList
-    where f a ("state", x)
-              = return $ parse state     (\x' -> a { stState = x' }) a x
-          f a ("volume", x)
-              = return $ parse parseNum  (\x' -> a { stVolume = x' }) a x
-          f a ("repeat", x)
-              = return $ parse parseBool (\x' -> a { stRepeat = x' }) a x
-          f a ("random", x)
-              = return $ parse parseBool (\x' -> a { stRandom = x' }) a x
-          f a ("playlist", x)
-              = return $ parse parseNum  (\x' -> a { stPlaylistVersion = x' }) a x
-          f a ("playlistlength", x)
-              = return $ parse parseNum  (\x' -> a { stPlaylistLength = x' }) a x
-          f a ("xfade", x)
-              = return $ parse parseNum  (\x' -> a { stXFadeWidth = x' }) a x
-          f a ("mixrampdb", x)
-              = return $ parse parseFrac (\x' -> a { stMixRampdB = x' }) a x
-          f a ("mixrampdelay", x)
-              = return $ parse parseFrac (\x' -> a { stMixRampDelay = x' }) a x
-          f a ("song", x)
-              = return $ parse parseNum  (\x' -> a { stSongPos = Just x' }) a x
-          f a ("songid", x)
-              = return $ parse parseNum  (\x' -> a { stSongID = Just x' }) a x
-          f a ("time", x)
-              = return $ parse time      (\x' -> a { stTime = x' }) a x
-          f a ("elapsed", x)
-              = return $ parse parseFrac (\x' -> a { stTime = (x', snd $ stTime a) }) a x
-          f a ("bitrate", x)
-              = return $ parse parseNum  (\x' -> a { stBitrate = x' }) a x
-          f a ("audio", x)
-              = return $ parse audio     (\x' -> a { stAudio = x' }) a x
-          f a ("updating_db", x)
-              = return $ parse parseNum  (\x' -> a { stUpdatingDb = x' }) a x
-          f a ("error", x)
-              = return a { stError = x }
-          f a ("single", x)
-              = return $ parse parseBool (\x' -> a { stSingle = x' }) a x
-          f a ("consume", x)
-              = return $ parse parseBool (\x' -> a { stConsume = x' }) a x
-          f a ("nextsong", x)
-              = return $ parse parseNum  (\x' -> a { stNextSongPos = Just x' }) a x
-          f a ("nextsongid", x)
-              = return $ parse parseNum  (\x' -> a { stNextSongID = Just x' }) a x
-          f _ x
-              = fail $ show x
+genOutput Nothing (k, v) =
+    case k of
+         "outputid" -> (Just . initOutput . int $ v, Continue)
+         _          -> (Nothing, Continue)
 
-          state "play"  = Just Playing
-          state "pause" = Just Paused
-          state "stop"  = Just Stopped
-          state _       = Nothing
+initOutput id_ =
+    Output { outID = id_
+           , outName = B.empty
+           , outEnabled = False
+           }
 
-          time s = case parseFrac *** parseNum $ breakChar ':' s of
-                       (Just a, Just b) -> Just (a, b)
-                       _                -> Nothing
+outputFold :: ObjFold Output
+outputFold = parseResponse genOutput
 
-          audio s = parseTriple ':' parseNum s
+-------------------------------------------------------------------
 
--- | Run a parser and lift the result into the 'MPD' monad
-runParser :: (MonadMPD m, MonadError MPDError m)
-          => (input -> Either String a) -> input -> m a
-runParser f = either (throwError . Unexpected) return . f
+-- | Generate Subsystem object
+genSubsystem :: Parser Subsystem
+genSubsystem Nothing (k, v) =
+    case k of
+         "changed" -> case B.unpack v of
+                           "database"        -> (Just DatabaseS, Continue)
+                           "update"          -> (Just UpdateS, Continue)
+                           "stored_playlist" -> (Just StoredPlaylistS, Continue)
+                           "playlist"        -> (Just PlaylistS, Continue)
+                           "player"          -> (Just PlayerS, Continue)
+                           "mixer"           -> (Just MixerS, Continue)
+                           "output"          -> (Just OutputS, Continue)
+                           "options"         -> (Just OptionsS, Continue)
+                           _                 -> (Nothing, Continue)
+         _         -> (Nothing, Continue)
 
--- | A helper that runs a parser on a string and, depending on the
--- outcome, either returns the result of some command applied to the
--- result, or a default value. Used when building structures.
-parse :: (String -> Maybe a) -> (a -> b) -> b -> String -> b
-parse parser f x = maybe x f . parser
+genSubsystem s _ = (s, Stop)
 
--- | A helper for running a parser returning Maybe on a pair of strings.
--- Returns Just if both strings where parsed successfully, Nothing otherwise.
-pair :: (String -> Maybe a) -> (String, String) -> Maybe (a, a)
-pair p (x, y) = case (p x, p y) of
-                    (Just a, Just b) -> Just (a, b)
-                    _                -> Nothing
+subsystemFold :: ObjFold Subsystem
+subsystemFold = parseResponse genSubsystem
+
+-------------------------------------------------------------------
+
+-- | Generate Entry object
+genEntry :: Parser Entry
+genEntry Nothing pair@(k, _) =
+    case k of
+         "directory" -> first (liftM DirectoryE) $ genDirectory Nothing pair
+         "file"      -> first (liftM SongE) $ genSong Nothing pair
+         "playlist"  -> first (liftM PlaylistE) $ genPlaylist Nothing pair
+         _           -> (Nothing, Continue)
+
+genEntry (Just (DirectoryE d)) pair = first (liftM DirectoryE) $ genDirectory (Just d) pair
+genEntry (Just (SongE s))      pair = first (liftM SongE) $ genSong (Just s) pair
+genEntry (Just (PlaylistE pl)) pair = first (liftM PlaylistE) $ genPlaylist (Just pl) pair
+
+entryFold :: ObjFold Entry
+entryFold = parseResponse genEntry
+
+-------------------------------------------------------------------
+
+-- | Generate Directory object
+genDirectory :: Parser Directory
+genDirectory Nothing (k, v) =
+    case k of
+         "directory" -> (Just . Directory $ v, Continue)
+         _           -> (Nothing, Continue)
+
+genDirectory d _ = (d, Stop)
+
+directoryFold :: ObjFold Directory
+directoryFold = parseResponse genDirectory
+
+--------------------------------------------------------------------
+
+-- | Generate Song object
+genSong :: Parser Song
+genSong Nothing (k, v) =
+    case k of
+         "file" -> (Just . initSong $ v, Continue)
+         _      -> (Nothing, Continue)
+
+genSong s@(Just s') (k, v) =
+    case k of
+        "Last-Modified" -> (Just $ s' { sgLastModified = parseIso8601 v }, Continue)
+        "Time"          -> (Just $ s' { sgLength = int v }, Continue)
+        "Id"            -> (Just $ s' { sgIndex = idval }, Continue)
+        "Pos"           -> (Just $ s' { sgIndex = posval }, Continue)
+        "file"          -> (s, Stop)
+        "directory"     -> (s, Stop)
+        "playlist"      -> (s, Stop)
+        _ -> case tagValue k of
+                  Just meta -> (Just $ s' { sgTags = M.insertWith' (++)
+                                             meta [v] (sgTags s')
+                                          }, Continue)
+                  Nothing   -> (s, Continue)
+    where
+          idval  = Just (maybe (-1) fst $ sgIndex s', int v)
+          posval = Just (int v, maybe (-1) snd $ sgIndex s')
+          
+          -- Why not just derive instance of Read? Because
+          -- using read is a few times slower than this.
+          tagValue "Artist" = Just Artist
+          tagValue "ArtistSort" = Just ArtistSort
+          tagValue "Album" = Just Album
+          tagValue "AlbumArtist" = Just AlbumArtist
+          tagValue "AlbumArtistSort" = Just AlbumArtistSort
+          tagValue "Title" = Just Title
+          tagValue "Track" = Just Track
+          tagValue "Name" = Just Name
+          tagValue "Genre" = Just Genre
+          tagValue "Date" = Just Date
+          tagValue "Composer" = Just Composer
+          tagValue "Performer" = Just Performer
+          tagValue "Disc" = Just Disc
+          tagValue "MUSICBRAINZ_ARTISTID" = Just MUSICBRAINZ_ARTISTID
+          tagValue "MUSICBRAINZ_ALBUMID" = Just MUSICBRAINZ_ALBUMID
+          tagValue "MUSICBRAINZ_ALBUMARTISTID" = Just MUSICBRAINZ_ALBUMARTISTID
+          tagValue "MUSICBRAINZ_TRACKID" = Just MUSICBRAINZ_TRACKID
+          tagValue _ = Nothing
+
+initSong path =
+    Song { sgFilePath = path
+         , sgTags = M.empty
+         , sgLastModified = Nothing
+         , sgLength = -1
+         , sgIndex = Nothing }
+
+songFold :: ObjFold Song
+songFold = parseResponse genSong
+
+-------------------------------------------------------------------
+
+-- | Generate Playlist object
+genPlaylist :: Parser Playlist
+genPlaylist Nothing (k, v) =
+    case k of
+         "playlist" -> (Just . initPlaylist $ v, Continue)
+         _          -> (Nothing, Continue)
+
+genPlaylist pl@(Just pl') (k, v) =
+    case k of
+         "Last-Modified" -> (Just $ pl' { plLastModified = parseIso8601 v }, Continue)
+         "playlist"      -> (pl, Stop)
+         "file"          -> (pl, Stop)
+         "directory"     -> (pl, Stop)
+         _               -> (pl, Continue)
+
+initPlaylist name =
+    Playlist { plName = name
+             , plLastModified = Nothing
+             }
+
+playlistFold :: ObjFold Playlist
+playlistFold = parseResponse genPlaylist
+
+-------------------------------------------------------------------
+
+-- | Generate (pos, id) pair
+genCposId :: Parser (Int, Int)
+genCposId Nothing (k, v) =
+    case k of
+         "cpos" -> (Just (int v, -1), Continue)
+         _      -> (Nothing, Continue)
+
+genCposId p@(Just p') (k, v) =
+    case k of
+         "Id"   -> (Just (fst p', int v), Continue)
+         "cpos" -> (p, Stop)
+         _      -> (p, Continue)
+
+cposIdFold :: ObjFold (Int, Int)
+cposIdFold = parseResponse genCposId
+
+-------------------------------------------------------------------
+
+-- | Generate (pos, path) pair
+genPosPath :: Parser (Int, B.ByteString)
+genPosPath Nothing (k, v) =
+    (Just (fromMaybe (-1) $ parseNum k, snd . toAssoc $ v), Continue)
+
+genPosPath pp _ = (pp, Stop)
+
+posPathFold :: ObjFold (Int, B.ByteString)
+posPathFold = parseResponse genPosPath
+
+-------------------------------------------------------------------
+
+-- | Generate Decoder object
+genDecoder :: Parser Decoder
+genDecoder Nothing (k, v) =
+    case k of
+         "plugin"    -> (Just $ Plugin v, Continue)
+         "suffix"    -> (Just $ Suffix v, Continue)
+         "mime_type" -> (Just $ MimeType v, Continue)
+         _           -> (Nothing, Continue)
+
+genDecoder d _ = (d, Stop)
+
+decoderFold :: ObjFold Decoder
+decoderFold = parseResponse genDecoder
+
+-------------------------------------------------------------------
+
+-- | Generate JobId Object
+genJobId :: Parser Int
+genJobId Nothing (k, v) =
+    if k == "updating_db"
+       then (parseInt v, Continue)
+       else (Nothing, Continue)
+
+genJobId jid _ = (jid, Stop)
+
+jobIdFold :: ObjFold Int
+jobIdFold = parseResponse genJobId
+
+-------------------------------------------------------------------
+
+-- | Generate Sticker Object
+genSticker :: Parser Sticker
+genSticker Nothing (k, v) =
+    if k == "sticker"
+       then (Just $ Sticker name value, Continue)
+       else (Nothing, Continue)
+    where
+          (name, value) = breakChar '=' v
+
+genSticker st _ = (st, Stop)
+
+stickerFold :: ObjFold Sticker
+stickerFold = parseResponse genSticker
+
+-------------------------------------------------------------------
+
+-- | Generate (path, sticker) pair
+genOwnedSticker :: Parser (B.ByteString, Sticker)
+genOwnedSticker Nothing (k, v) =
+    if k == "file"
+       then (Just (v, Sticker B.empty B.empty), Continue)
+       else (Nothing, Continue)
+
+genOwnedSticker s@(Just (path, _)) (k, v) =
+    case k of
+         "sticker" -> (Just (path, Sticker name value), Continue)
+         "file"    -> (s, Stop)
+         _         -> (s, Continue)
+    where
+          (name, value) = breakChar '=' v
+
+ownedStickerFold :: ObjFold (B.ByteString, Sticker)
+ownedStickerFold = parseResponse genOwnedSticker
+
+-------------------------------------------------------------------
+
+genElementNamed :: String -> Parser B.ByteString
+genElementNamed elname Nothing (k, v) =
+    if elname == k
+       then (Just v, Continue)
+       else (Nothing, Continue)
+
+genElementNamed _ el _ = (el, Stop)
+
+elementNamedFold :: String -> ObjFold B.ByteString
+elementNamedFold elname = parseResponse $ genElementNamed elname
+
+-------------------------------------------------------------------
+
+-- | Generate Count object
+genCount' :: Parser Count
+genCount' c (k, v) =
+    case k of
+        "songs"    -> (Just $ c' { cSongs = int v }, Continue)
+        "playtime" -> (Just $ c' { cPlaytime = int v }, Continue)
+        _          -> (c, Continue)
+    where
+          c' = fromMaybe defaultCount c
+
+defaultCount =
+    Count { cSongs = -1, cPlaytime = -1 }
+
+genCount :: ObjGen Count
+genCount = parseResponse genCount' (const . return . Just) Nothing
+
+-------------------------------------------------------------------
+
+-- | Generate Stats object
+genStats' :: Parser Stats
+genStats' s (k, v) =
+    case k of
+        "artists"     -> (Just $ s' { stsArtists = int v }, Continue)
+        "albums"      -> (Just $ s' { stsAlbums = int v }, Continue)
+        "songs"       -> (Just $ s' { stsSongs = int v }, Continue)
+        "uptime"      -> (Just $ s' { stsUptime = int v }, Continue)
+        "playtime"    -> (Just $ s' { stsPlaytime = int v }, Continue)
+        "db_playtime" -> (Just $ s' { stsDbPlaytime = int v }, Continue)
+        "db_update"   -> (Just $ s' { stsDbUpdate = int v }, Continue)
+        _             -> (s, Continue)
+    where
+          s' = fromMaybe defaultStats s
+
+defaultStats =
+     Stats { stsArtists = -1, stsAlbums = -1, stsSongs = -1, stsUptime = -1
+           , stsPlaytime = -1, stsDbPlaytime = -1, stsDbUpdate = -1 }
+
+genStats :: ObjGen Stats
+genStats = parseResponse genStats' (const . return . Just) Nothing
+
+-------------------------------------------------------------------
+
+-- | Generate Status object
+genStatus' :: Parser Status
+genStatus' s (k, v) =
+    case k of
+       "volume"         -> (Just $ s' { stVolume = int v }, Continue)
+       "repeat"         -> (Just $ s' { stRepeat = bool v }, Continue)
+       "random"         -> (Just $ s' { stRandom = bool v }, Continue)
+       "single"         -> (Just $ s' { stSingle = bool v }, Continue)
+       "consume"        -> (Just $ s' { stConsume = bool v }, Continue)
+       "playlist"       -> (Just $ s' { stPlaylistID = integer v }, Continue)
+       "playlistlength" -> (Just $ s' { stPlaylistLength = int v }, Continue)
+       "xfade"          -> (Just $ s' { stXFadeWidth = int v }, Continue)
+       "mixrampdb"      -> (Just $ s' { stMixRampdB = frac v }, Continue)
+       "mixrampdelay"   -> (Just $ s' { stMixRampDelay = frac v }, Continue)
+       "state"          -> (Just $ s' { stState = state }, Continue)
+       "song"           -> (Just $ s' { stSongPos = parseInt v }, Continue)
+       "songid"         -> (Just $ s' { stSongID = parseInt v }, Continue)
+       "time"           -> (Just $ s' { stTime = time }, Continue)
+       "elapsed"        -> (Just $ s' { stTime = (frac v, snd $ stTime s') }, Continue)
+       "bitrate"        -> (Just $ s' { stBitrate = int v }, Continue)
+       "audio"          -> (Just $ s' { stAudio = audio }, Continue)
+       "nextsong"       -> (Just $ s' { stNextSongPos = parseInt v }, Continue)
+       "nextsongid"     -> (Just $ s' { stNextSongID = parseInt v }, Continue)
+       "error"          -> (Just $ s' { stError = Just v }, Continue)
+       _                -> (s, Continue)
+    where
+          s' = fromMaybe defaultStatus s
+          
+          integer v = fromMaybe (-1) $ parseInteger v
+          frac v    = fromMaybe (read "NaN") $ parseFrac v
+          audio     = fromMaybe (-1, -1, -1) $ parseTriple ':' parseInt v
+          
+          state =
+              case B.unpack v of
+                   "play"  -> Playing
+                   "pause" -> Paused
+                   _       -> Stopped
+          
+          time =
+              case parseFrac *** parseInt $ breakChar ':' v of
+                   (Just a, Just b) -> (a, b)
+                   _                -> (-1, -1)
+
+defaultStatus =
+    Status { stState = Stopped, stVolume = -1, stRepeat = False
+           , stRandom = False, stPlaylistID = -1, stPlaylistLength = -1
+           , stSongPos = Nothing, stSongID = Nothing, stTime = (-1, -1)
+           , stNextSongPos = Nothing, stNextSongID = Nothing
+           , stBitrate = -1, stXFadeWidth = -1, stMixRampdB = -1
+           , stMixRampDelay = -1, stAudio = (-1, -1, -1), stUpdatingDb = 0
+           , stSingle = False, stConsume = False, stError = Nothing }
+
+genStatus :: ObjGen Status
+genStatus = parseResponse genStatus' (const . return . Just) Nothing
+
+-------------------------------------------------------------------
+
+-- | Generate ReplayGainMode object
+genReplayGainMode :: (String, B.ByteString) -> Maybe ReplayGainMode
+genReplayGainMode ("replay_gain_mode", v) =
+    case B.unpack v of
+         "off"   -> Just RGOff
+         "track" -> Just RGTrack
+         "album" -> Just RGAlbum
+         _       -> Nothing
+
+genReplayGainMode _ = Nothing
+
+-------------------------------------------------------------------
+
+-- | Helper conversion functions
+int v  = fromMaybe (-1)  $ parseInt v
+bool v = fromMaybe False $ parseBool v
+

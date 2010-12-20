@@ -1,5 +1,3 @@
-{-# LANGUAGE PatternGuards #-}
-
 -- | Module    : Network.MPD.Commands
 -- Copyright   : (c) Ben Sinclair 2005-2009, Joachim Fasting 2010
 -- License     : LGPL (see LICENSE)
@@ -16,7 +14,7 @@ module Network.MPD.Commands (
     module Network.MPD.Commands.Query,
 
     -- * Querying MPD's status
-    clearError, currentSong, idle, noidle, status, stats,
+    clearError, currentSong, idle, getIdle, noidle, status, stats,
 
     -- * Playback options
     consume, crossfade, random, repeat, setVolume, single, replayGainMode,
@@ -26,18 +24,17 @@ module Network.MPD.Commands (
     next, pause, play, playId, previous, seek, seekId, stop,
 
     -- * The current playlist
-    add, add_, addId, clear, delete, deleteId, move, moveId, {-playlist,-} playlistId,
-    playlistFind, playlistInfo, playlistSearch, plChanges, plChangesPosId, shuffle, swap,
-    swapId,
+    add, addId, clear, delete, deleteId, move, moveId, playlist,
+    playlistFind, playlistInfo, playlistSearch, plChanges,
+    plChangesPosId, shuffle, swap, swapId,
 
     -- * Stored playlist
     listPlaylist, listPlaylistInfo, listPlaylists, load, playlistAdd,
-    playlistAdd_, playlistClear, playlistDelete, playlistMove, rename, rm,
-    save,
+    playlistClear, playlistDelete, playlistMove, rename, rm, save,
 
     -- * The music database
-    count, find, findAdd, list, listAll, listAllInfo, lsInfo, search, update,
-    rescan,
+    count, find, findAdd, list, listAlbums, listAll, listAllInfo, lsInfo,
+    search, update, rescan,
 
     -- * Stickers
     stickerGet, stickerSet, stickerDelete, stickerList, stickerFind,
@@ -60,9 +57,9 @@ import Network.MPD.Commands.Util
 import Network.MPD.Core
 import Network.MPD.Utils
 
-import Control.Monad (liftM)
-import Control.Monad.Error (throwError)
+import qualified Data.ByteString.Char8 as B
 import Prelude hiding (repeat)
+import Control.Monad.Error (catchError, throwError)
 
 --
 -- Querying MPD's status
@@ -70,44 +67,37 @@ import Prelude hiding (repeat)
 
 -- | Clear the current error message in status.
 clearError :: MonadMPD m => m ()
-clearError = getResponse_ "clearerror"
+clearError = send "clearerror" >> receive_
 
--- | Get the currently playing song.
-currentSong :: (Functor m, MonadMPD m) => m (Maybe Song)
-currentSong = do
-    cs <- status
-    if stState cs == Stopped
-       then return Nothing
-       else getResponse1 "currentsong" >>=
-            fmap Just . runParser parseSong . toAssocList
+-- | Get the current song.
+currentSong :: MonadMPD m => m (Maybe Song)
+currentSong =
+    send "currentsong" >> receive >>= songFold (const . return . Just) Nothing
 
--- | Wait until there is a noteworthy change in one or more of MPD's
--- susbystems. Note that running this command will block until either 'idle'
--- returns or is cancelled by 'noidle'.
-idle :: MonadMPD m => m [Subsystem]
-idle =
-    mapM (\("changed", system) -> case system of "database" -> return DatabaseS
-                                                 "update"   -> return UpdateS
-                                                 "stored_playlist" -> return StoredPlaylistS
-                                                 "playlist" -> return PlaylistS
-                                                 "player" -> return PlayerS
-                                                 "mixer" -> return MixerS
-                                                 "output" -> return OutputS
-                                                 "options" -> return OptionsS
-                                                 k -> fail ("Unknown subsystem: " ++ k))
-         =<< toAssocList `liftM` getResponse "idle"
+-- | Make MPD server notify the client if there is a noteworthy change
+-- in one or more of its subsystems. Note that after running this command
+-- you can either monitor handle for incoming notifications, wait for events
+-- using 'getIdle or cancel this by 'noidle'. Any command other than 'noidle'
+-- sent to MPD server while idle is active will close the connection.
+idle :: MonadMPD m => [Subsystem] -> m ()
+idle ss = send ("idle" <$> foldr (<++>) (Args []) ss)
+
+-- | Fold over idle notifications. If there is no notifications ready
+--   at the moment, this function will block until they show up.
+getIdle :: MonadMPD m => (Subsystem -> b -> m b) -> b -> m b
+getIdle f acc = receive >>= subsystemFold f acc
 
 -- | Cancel 'idle'.
 noidle :: MonadMPD m => m ()
-noidle = getResponse_ "noidle"
+noidle = send "noidle" >> receive_
 
 -- | Get server statistics.
-stats :: MonadMPD m => m Stats
-stats = getResponse "stats" >>= runParser parseStats
+stats :: MonadMPD m => m (Maybe Stats)
+stats = send "stats" >> receive >>= genStats
 
 -- | Get the server's status.
-status :: MonadMPD m => m Status
-status = getResponse "status" >>= runParser parseStatus
+status :: MonadMPD m => m (Maybe Status)
+status = send "status" >> receive >>= genStatus
 
 --
 -- Playback options
@@ -115,35 +105,37 @@ status = getResponse "status" >>= runParser parseStatus
 
 -- | Set consume mode
 consume :: MonadMPD m => Bool -> m ()
-consume = getResponse_ . ("consume" <$>)
+consume v = send ("consume" <$> v) >> receive_
 
 -- | Set crossfading between songs.
-crossfade :: MonadMPD m => Seconds -> m ()
-crossfade secs = getResponse_ ("crossfade" <$> secs)
+crossfade :: MonadMPD m => Int -> m ()
+crossfade secs = send ("crossfade" <$> secs) >> receive_
 
 -- | Set random playing.
 random :: MonadMPD m => Bool -> m ()
-random = getResponse_ . ("random" <$>)
+random v = send ("random" <$> v) >> receive_
 
 -- | Set repeating.
 repeat :: MonadMPD m => Bool -> m ()
-repeat = getResponse_ . ("repeat" <$>)
+repeat v = send ("repeat" <$> v) >> receive_
 
 -- | Set the volume (0-100 percent).
 setVolume :: MonadMPD m => Int -> m ()
-setVolume = getResponse_ . ("setvol" <$>)
+setVolume v = send ("setvol" <$> v) >> receive_
 
 -- | Set single mode
 single :: MonadMPD m => Bool -> m ()
-single = getResponse_ . ("single" <$>)
+single v = send ("single" <$> v) >> receive_
 
 -- | Set the replay gain mode.
 replayGainMode :: MonadMPD m => ReplayGainMode -> m ()
-replayGainMode = getResponse_ . ("replay_gain_mode" <$>)
+replayGainMode mode = send ("replay_gain_mode" <$> mode) >> receive_
 
 -- | Get the replay gain options.
-replayGainStatus :: MonadMPD m => m [String]
-replayGainStatus = getResponse "replay_gain_status"
+replayGainStatus :: MonadMPD m => m (Maybe ReplayGainMode)
+replayGainStatus = do
+    send "replay_gain_status"
+    receive1 >>= return . genReplayGainMode . toAssoc . head
 
 --
 -- Controlling playback
@@ -151,270 +143,274 @@ replayGainStatus = getResponse "replay_gain_status"
 
 -- | Play the next song.
 next :: MonadMPD m => m ()
-next = getResponse_ "next"
+next = send "next" >> receive_
 
 -- | Pause playing.
 pause :: MonadMPD m => Bool -> m ()
-pause = getResponse_ . ("pause" <$>)
+pause v = send ("pause" <$> v) >> receive_
 
 -- | Begin\/continue playing.
 play :: MonadMPD m => Maybe Int -> m ()
-play (Just pos) = getResponse_ ("play" <$> pos)
-play _          = getResponse_  "play"
+play (Just pos) = send ("play" <$> pos) >> receive_
+play _          = send  "play"          >> receive_
 
 -- | Play a file with given id.
 playId :: MonadMPD m => Int -> m ()
-playId id' = getResponse_ ("playid" <$> id')
+playId id' = send ("playid" <$> id') >> receive_
 
 -- | Play the previous song.
 previous :: MonadMPD m => m ()
-previous = getResponse_ "previous"
+previous = send "previous" >> receive_
 
 -- | Seek to some point in a song.
-seek :: MonadMPD m => Int -> Seconds -> m ()
-seek pos time = getResponse_ ("seek" <$> pos <++> time)
+seek :: MonadMPD m => Int -> Int -> m ()
+seek pos time = send ("seek" <$> pos <++> time) >> receive_
 
 -- | Seek to some point in a song (id version)
-seekId :: MonadMPD m => Int -> Seconds -> m ()
-seekId id' time = getResponse_ ("seekid" <$> id' <++> time)
+seekId :: MonadMPD m => Int -> Int -> m ()
+seekId id' time = send ("seekid" <$> id' <++> time) >> receive_
 
 -- | Stop playing.
 stop :: MonadMPD m => m ()
-stop = getResponse_ "stop"
+stop = send "stop" >> receive_
 
 --
 -- The current playlist
 --
 
--- This might do better to throw an exception than silently return 0.
--- | Like 'add', but returns a playlist id.
-addId :: MonadMPD m => Path -> Maybe Integer -- ^ Optional playlist position
-      -> m Int
-addId p pos = liftM (parse parseNum id 0 . snd . head . toAssocList)
-              $ getResponse1 ("addid" <$> p <++> pos)
-
--- | Like 'add_' but returns a list of the files added.
-add :: MonadMPD m => Path -> m [Path]
-add x = add_ x >> listAll x
-
 -- | Add a song (or a whole directory) to the current playlist.
-add_ :: MonadMPD m => Path -> m ()
-add_ path = getResponse_ ("add" <$> path)
+add :: MonadMPD m => String -> m ()
+add path = send ("add" <$> path) >> receive_
+
+-- | Like 'add', but returns a song id.
+addId :: MonadMPD m => String -> Maybe Int -> m (Maybe Int)
+addId path pos = do
+    send ("addid" <$> path <++> pos)
+    receive1 >>= return . parseInt . snd . toAssoc . head
 
 -- | Clear the current playlist.
 clear :: MonadMPD m => m ()
-clear = getResponse_ "clear"
+clear = send "clear" >> receive_
 
 -- | Remove a song from the current playlist.
 delete :: MonadMPD m => Int -> m ()
-delete pos = getResponse_ ("delete" <$> pos)
+delete pos = send ("delete" <$> pos) >> receive_
 
 -- | Remove a song from the current playlist.
 deleteId :: MonadMPD m => Int -> m ()
-deleteId id' = getResponse_ ("deleteid" <$> id')
+deleteId id' = send ("deleteid" <$> id') >> receive_
 
 -- | Move a song to a given position in the current playlist.
 move :: MonadMPD m => Int -> Int -> m ()
-move pos to = getResponse_ ("move" <$> pos <++> to)
+move pos to = send ("move" <$> pos <++> to) >> receive_
 
 -- | Move a song from (songid) to (playlist index) in the playlist. If to is
 -- negative, it is relative to the current song in the playlist (if there is one).
 moveId :: MonadMPD m => Int -> Int -> m ()
-moveId id' to = getResponse_ ("moveid" <$> id' <++> to)
+moveId id' to = send ("moveid" <$> id' <++> to) >> receive_
 
--- | Retrieve file paths and positions of songs in the current playlist.
+-- | Fold over file paths and positions of songs in the current playlist.
 -- Note that this command is only included for completeness sake; it's
 -- deprecated and likely to disappear at any time, please use 'playlistInfo'
 -- instead.
-{- playlist :: MonadMPD m => m [(PLIndex, Path)]
-playlist = mapM f =<< getResponse "playlist"
-    where f s | (pos, name) <- breakChar ':' s
-              , Just pos'   <- parseNum pos
-              = return (Pos pos', name)
-              | otherwise = throwError . Unexpected $ show s -}
+playlist :: MonadMPD m => ((Int, B.ByteString) -> b -> m b) -> b -> m b
+playlist f acc = send "playlist" >> receive >>= posPathFold f acc
 
--- | Search for songs in the current playlist with strict matching.
-playlistFind :: MonadMPD m => Query -> m [Song]
-playlistFind q = takeSongs =<< getResponse ("playlistfind" <$> q)
+-- | Fold over a list of songs in the playlist.
+-- If first argument is:
+--  - Just Left, only one song is returned.
+--  - Just Right, songs from given range are returned
+--  - Nothing, whole playlist is returned
+playlistInfo :: MonadMPD m => Maybe (Either Int (Int, Int))
+                -> (Song -> b -> m b) -> b -> m b
+playlistInfo bounds f acc =
+    send ("playlistinfo" <$> bounds) >> receive >>= songFold f acc
 
--- | Retrieve metadata for songs in the current playlist.
-playlistInfo :: MonadMPD m => Maybe (Int, Int) -> m [Song]
-playlistInfo range = takeSongs =<< getResponse ("playlistinfo" <$> range)
+-- | Search for songs in the current playlist with
+-- strict matching and fold over a list of results.
+playlistFind :: MonadMPD m => Query -> (Song -> b -> m b) -> b -> m b
+playlistFind q f acc = do
+    send ("playlistfind" <$> q)
+    receive >>= songFold f acc
 
--- | Displays a list of songs in the playlist.
--- If id is specified, only its info is returned.
-playlistId :: MonadMPD m => Maybe Int -> m [Song]
-playlistId id' = takeSongs =<< getResponse ("playlistinfo" <$> id')
+-- | Search case-insensitively with partial matches for
+-- songs in the current playlist and fold over a list results.
+playlistSearch :: MonadMPD m => Query -> (Song -> b -> m b) -> b -> m b
+playlistSearch q f acc =
+    send ("playlistsearch" <$> q) >> receive >>= songFold f acc
 
--- | Search case-insensitively with partial matches for songs in the
--- current playlist.
-playlistSearch :: MonadMPD m => Query -> m [Song]
-playlistSearch q = takeSongs =<< getResponse ("playlistsearch" <$> q)
-
--- | Retrieve a list of changed songs currently in the playlist since
+-- | Fold over a list of changed songs currently in the playlist since
 -- a given playlist version.
-plChanges :: MonadMPD m => Integer -> m [Song]
-plChanges version = takeSongs =<< getResponse ("plchanges" <$> version)
+plChanges :: MonadMPD m => Integer -> (Song -> b -> m b) -> b -> m b
+plChanges version f acc = do
+    send ("plchanges" <$> version)
+    receive >>= songFold f acc
 
--- | Like 'plChanges' but only returns positions and ids.
-plChangesPosId :: MonadMPD m => Integer -> m [(Int, Int)]
-plChangesPosId plver =
-    getResponse ("plchangesposid" <$> plver) >>=
-    mapM f . splitGroups [("cpos",id)] . toAssocList
-    where f xs | [("cpos", x), ("Id", y)] <- xs
-               , Just (x', y') <- pair parseNum (x, y)
-               = return (x', y')
-               | otherwise = throwError . Unexpected $ show xs
+-- | Like 'playlistChanges' but only returns positions and ids.
+plChangesPosId :: MonadMPD m => Integer -> ((Int, Int) -> b -> m b) -> b -> m b
+plChangesPosId version f acc =
+    send ("plchangesposid" <$> version) >> receive >>= cposIdFold f acc
 
--- | Shuffle the playlist.
-shuffle :: MonadMPD m => Maybe (Int, Int) -- ^ Optional range (start, end)
-        -> m ()
-shuffle range = getResponse_ ("shuffle" <$> range)
+-- | Shuffle the playlist or the part of it
+shuffle :: MonadMPD m => Maybe (Int, Int) -> m ()
+shuffle range = send ("shuffle" <$> range) >> receive_
 
--- | Swap the positions of two songs.
+-- | Swap the positions of two songs with given pos.
 swap :: MonadMPD m => Int -> Int -> m ()
-swap pos1 pos2 = getResponse_ ("swap" <$> pos1 <++> pos2)
+swap pos1 pos2 = send ("swap" <$> pos1 <++> pos2) >> receive_
 
--- | Swap the positions of two songs (Id version
+-- | Swap the positions of two songs with given ids.
 swapId :: MonadMPD m => Int -> Int -> m ()
-swapId id1 id2 = getResponse_ ("swapid" <$> id1 <++> id2)
+swapId id1 id2 = send ("swapid" <$> id1 <++> id2) >> receive_
 
 --
 -- Stored playlists
 --
 
 -- | Retrieve a list of files in a given playlist.
-listPlaylist :: MonadMPD m => PlaylistName -> m [Path]
-listPlaylist plname =
-    liftM takeValues $ getResponse ("listplaylist" <$> plname)
+listPlaylist :: MonadMPD m => String -> (B.ByteString -> b -> m b) -> b -> m b
+listPlaylist name f acc =
+    send ("listplaylist" <$> name) >> receive >>= elementNamedFold "file" f acc
 
--- | Retrieve metadata for files in a given playlist.
-listPlaylistInfo :: MonadMPD m => PlaylistName -> m [Song]
-listPlaylistInfo plname =
-    takeSongs =<< getResponse ("listplaylistinfo" <$> plname)
+   -- | Fold over a list of songs in a given playlist.
+listPlaylistInfo :: MonadMPD m => String -> (Song -> b -> m b) -> b -> m b
+listPlaylistInfo name f acc =
+    send ("listplaylistinfo" <$> name) >> receive >>= songFold f acc
 
 -- | Retreive a list of stored playlists.
-listPlaylists :: MonadMPD m => m [PlaylistName]
-listPlaylists = (go [] . toAssocList) `liftM` getResponse "listplaylists"
-    where
-        -- After each playlist name we get a timestamp
-        go acc [] = acc
-        go acc ((_, b):_:xs) = go (b : acc) xs
-        go _ _ = error "listPlaylists: bug"
+listPlaylists :: MonadMPD m => (Playlist -> b -> m b) -> b -> m b
+listPlaylists f acc =
+    send "listplaylists" >>  receive >>= playlistFold f acc
 
 -- | Load an existing playlist.
-load :: MonadMPD m => PlaylistName -> m ()
-load plname = getResponse_ ("load" <$> plname)
-
--- | Like 'playlistAdd' but returns a list of the files added.
-playlistAdd :: MonadMPD m => PlaylistName -> Path -> m [Path]
-playlistAdd plname path = playlistAdd_ plname path >> listAll path
+load :: MonadMPD m => String -> m ()
+load name = send ("load" <$> name) >> receive_
 
 -- | Add a song (or a whole directory) to a stored playlist.
 -- Will create a new playlist if the one specified does not already exist.
-playlistAdd_ :: MonadMPD m => PlaylistName -> Path -> m ()
-playlistAdd_ plname path = getResponse_ ("playlistadd" <$> plname <++> path)
+playlistAdd :: MonadMPD m => String -> String -> m ()
+playlistAdd name path =
+    send ("playlistadd" <$> name <++> path) >> receive_
 
 -- | Clear a playlist. If the specified playlist does not exist, it will be
 -- created.
-playlistClear :: MonadMPD m => PlaylistName -> m ()
-playlistClear = getResponse_ . ("playlistclear" <$>)
+playlistClear :: MonadMPD m => String -> m ()
+playlistClear name = send ("playlistclear" <$> name) >> receive_
+
 
 -- | Remove a song from a playlist.
-playlistDelete :: MonadMPD m => PlaylistName
-               -> Integer -- ^ Playlist position
+playlistDelete :: MonadMPD m => String
+               -> Int -- ^ Playlist position
                -> m ()
-playlistDelete name pos = getResponse_ ("playlistdelete" <$> name <++> pos)
+playlistDelete name pos =
+    send ("playlistdelete" <$> name <++> pos) >> receive_
 
 -- | Move a song to a given position in the playlist specified.
-playlistMove :: MonadMPD m => PlaylistName -> Integer -> Integer -> m ()
+playlistMove :: MonadMPD m => String -> Int -> Int -> m ()
 playlistMove name from to =
-    getResponse_ ("playlistmove" <$> name <++> from <++> to)
+    send ("playlistmove" <$> name <++> from <++> to) >> receive_
 
 -- | Rename an existing playlist.
 rename :: MonadMPD m
-       => PlaylistName -- ^ Original playlist
-       -> PlaylistName -- ^ New playlist name
+       => String -- ^ Original playlist
+       -> String -- ^ New playlist name
        -> m ()
-rename plname new = getResponse_ ("rename" <$> plname <++> new)
+rename old new = send ("rename" <$> old <++> new) >> receive_
 
 -- | Delete existing playlist.
-rm :: MonadMPD m => PlaylistName -> m ()
-rm plname = getResponse_ ("rm" <$> plname)
+rm :: MonadMPD m => String -> m ()
+rm name = send ("rm" <$> name) >> receive_
 
 -- | Save the current playlist.
-save :: MonadMPD m => PlaylistName -> m ()
-save plname = getResponse_ ("save" <$> plname)
+save :: MonadMPD m => String -> m ()
+save name = send ("save" <$> name) >> receive_
 
 --
 -- The music database
 --
 
 -- | Count the number of entries matching a query.
-count :: MonadMPD m => Query -> m Count
-count query = getResponse ("count" <$>  query) >>= runParser parseCount
+count :: MonadMPD m => Query -> m (Maybe Count)
+count query =
+    send ("count" <$> query) >> receive >>= genCount
 
--- | Search the database for entries exactly matching a query.
-find :: MonadMPD m => Query -> m [Song]
-find query = getResponse ("find" <$> query) >>= takeSongs
+-- | Search the database for entries exactly matching
+-- a query and fold over a list of results.
+find :: MonadMPD m => Query -> (Song -> b -> m b) -> b -> m b
+find query f acc =
+    send ("find" <$> query) >> receive >>= songFold f acc
 
 -- | Adds songs matching a query to the current playlist.
 findAdd :: MonadMPD m => Query -> m ()
-findAdd q = getResponse_ ("findadd" <$> q)
+findAdd query = send ("findadd" <$> query) >> receive_
 
--- | List all metadata of metadata (sic).
-list :: MonadMPD m
-     => Metadata -- ^ Metadata to list
-     -> Query -> m [String]
-list mtype query = liftM takeValues $ getResponse ("list" <$> mtype <++> query)
+-- | Fold over a list of all tags of the specified type.
+list :: MonadMPD m => Metadata -> (B.ByteString -> b -> m b) -> b -> m b
+list meta f acc =
+    send ("list" <$> meta) >> receive >>= elementNamedFold (show meta) f acc
 
--- | List the songs (without metadata) in a database directory recursively.
-listAll :: MonadMPD m => Path -> m [Path]
-listAll path = liftM (map snd . filter ((== "file") . fst) . toAssocList)
-                     (getResponse $ "listall" <$> path)
+-- | Fold over a list of albums of given artist.
+listAlbums :: MonadMPD m => String -> (B.ByteString -> b -> m b) -> b -> m b
+listAlbums artist f acc = do
+    send ("list" <$> Album <++> artist)
+    receive >>= elementNamedFold "Album" f acc
 
--- Helper for lsInfo and listAllInfo.
-lsInfo' :: MonadMPD m => String -> Path -> m [Either Path Song]
-lsInfo' cmd path =
-    liftM (extractEntries (Just . Right, const Nothing, Just . Left)) $
-         takeEntries =<< getResponse (cmd <$> path)
+-- | Fold over a list of songs (without metadata) in a database directory recursively.
+listAll :: MonadMPD m => String -> (B.ByteString -> b -> m b) -> b -> m b
+listAll path f acc =
+    send ("listall" <$> path) >> receive >>= elementNamedFold "file" f acc
+
+-- | Non-recursively fold over the content of a database directory.
+lsInfo :: MonadMPD m => String -> (Entry -> b -> m b) -> b -> m b
+lsInfo path f acc =
+    send ("lsinfo" <$> path) >> receive >>= entryFold f acc
 
 -- | Recursive 'lsInfo'.
-listAllInfo :: MonadMPD m => Path -> m [Either Path Song]
-listAllInfo = lsInfo' "listallinfo"
+listAllInfo :: MonadMPD m => String -> (Entry -> b -> m b) -> b -> m b
+listAllInfo path f acc =
+    send ("listallinfo" <$> path) >> receive >>= entryFold f acc
 
--- | Non-recursively list the contents of a database directory.
-lsInfo :: MonadMPD m => Path -> m [Either Path Song]
-lsInfo = lsInfo' "lsinfo"
+-- | Search the database using case insensitive matching and fold over a list of results.
+search :: MonadMPD m => Query -> (Song -> b -> m b) -> b -> m b
+search query f acc = send ("search" <$> query) >> receive >>= songFold f acc
 
--- | Search the database using case insensitive matching.
-search :: MonadMPD m => Query -> m [Song]
-search query = getResponse ("search" <$> query) >>= takeSongs
-
--- | Update the server's database.
--- If no paths are given, all paths will be scanned.
+-- | Update the server's database and fold over a list of job ids.
+-- If no paths are given, all database will be scanned.
 -- Unreadable or non-existent paths are silently ignored.
-update :: MonadMPD m => [Path] -> m ()
-update  [] = getResponse_ "update"
-update [x] = getResponse_ ("update" <$> x)
-update xs  = getResponses (map ("update" <$>) xs) >> return ()
+update :: MonadMPD m => [String] -> (Int -> b -> m b) -> b -> m b
+update xs f acc = do
+    case xs of
+         []  -> send "update"
+         [x] -> send ("update" <$> x)
+         _   -> sendMany (map ("update" <$>) xs)
+    receive >>= jobIdFold f acc
 
 -- | Like 'update' but also rescans unmodified files.
-rescan :: MonadMPD m => [Path] -> m ()
-rescan []  = getResponse_ "rescan"
-rescan [x] = getResponse_ ("rescan" <$> x)
-rescan xs  = getResponses (map ("rescan" <$>) xs) >> return ()
+rescan :: MonadMPD m => [String] -> (Int -> b -> m b) -> b -> m b
+rescan xs f acc = do
+    case xs of
+         []  -> send "rescan"
+         [x] -> send ("rescan" <$> x)
+         _   -> sendMany (map ("rescan" <$>) xs)
+    receive >>= jobIdFold f acc
 
 --
 -- Stickers
 --
 
 -- | Reads a sticker value for the specified object.
+-- Note: if sticker is not present, it returns Nothning
+-- instead of throwing exception.
 stickerGet :: MonadMPD m => ObjectType
            -> String -- ^ Object URI
            -> String -- ^ Sticker name
-           -> m [String]
-stickerGet typ uri name = takeValues `liftM` getResponse ("sticker get" <$> typ <++> uri <++> name)
+           -> m (Maybe Sticker)
+stickerGet otype uri name = do
+    send ("sticker get" <$> otype <++> uri <++> name)
+    receive1 `catchError` check >>= stickerFold (const . return . Just) Nothing
+    where
+          check (ACK FileNotFound "sticker" "no such sticker") = return []
+          check e = throwError e
 
 -- | Adds a sticker value to the specified object.
 stickerSet :: MonadMPD m => ObjectType
@@ -422,48 +418,49 @@ stickerSet :: MonadMPD m => ObjectType
            -> String -- ^ Sticker name
            -> String -- ^ Sticker value
            -> m ()
-stickerSet typ uri name value =
-    getResponse_ ("sticker set" <$> typ <++> uri <++> name <++> value)
+stickerSet otype uri name value =
+    send ("sticker set" <$> otype <++> uri <++> name <++> value) >> receive_
 
 -- | Delete a sticker value from the specified object.
 stickerDelete :: MonadMPD m => ObjectType
               -> String -- ^ Object URI
               -> String -- ^ Sticker name
               -> m ()
-stickerDelete typ uri name =
-    getResponse_ ("sticker delete" <$> typ <++> uri <++> name)
+stickerDelete otype uri name =
+    send ("sticker delete" <$> otype <++> uri <++> name) >> receive_
 
--- | Lists the stickers for the specified object.
+-- | Fold over a stickers list of the specified object.
 stickerList :: MonadMPD m => ObjectType
             -> String -- ^ Object URI
-            -> m [(String, String)] -- ^ Sticker name\/sticker value
-stickerList typ uri =
-    toAssocList `liftM` getResponse ("sticker list" <$> typ <++> uri)
+            -> (Sticker -> b -> m b) -> b -> m b
+stickerList otype uri f acc =
+    send ("sticker list" <$> otype <++> uri) >> receive >>= stickerFold f acc
 
 -- | Searches the sticker database for stickers with the specified name, below
--- the specified path.
+-- the specified path and folds over a list of results.
 stickerFind :: MonadMPD m => ObjectType
             -> String -- ^ Path
             -> String -- ^ Sticker name
-            -> m [(String, String)] -- ^ URI\/sticker value
-stickerFind typ uri name =
-    toAssocList `liftM`
-    getResponse ("sticker find" <$> typ <++> uri <++> name)
+            -> ((B.ByteString, Sticker) -> b -> m b) -> b -> m b
+stickerFind otype uri name f acc = do
+    send ("sticker find" <$> otype <++> uri <++> name)
+    receive >>= ownedStickerFold f acc
 
 --
 -- Connection
 --
 
--- XXX should the password be quoted? Change "++" to "<$>" if so.  If
---     it should, it also needs to be fixed in N.M.Core.
 -- | Send password to server to authenticate session.
 -- Password is sent as plain text.
-password :: MonadMPD m => String -> m ()
-password = getResponse_ . ("password " ++)
+-- Note: password has to be set previously using
+-- setPassword function (or specified in host variable)
+password :: MonadMPD m => m ()
+password =
+    getPassword >>= send . ("password " <$>) >> receive_
 
 -- | Check that the server is still responding.
 ping :: MonadMPD m => m ()
-ping = getResponse_ "ping"
+ping = send "ping" >> receive_
 
 --
 -- Audio output devices
@@ -471,41 +468,42 @@ ping = getResponse_ "ping"
 
 -- | Turn off an output device.
 disableOutput :: MonadMPD m => Int -> m ()
-disableOutput = getResponse_ . ("disableoutput" <$>)
+disableOutput oid = send ("disableoutput" <$> oid) >> receive_
 
 -- | Turn on an output device.
 enableOutput :: MonadMPD m => Int -> m ()
-enableOutput = getResponse_ . ("enableoutput" <$>)
+enableOutput oid = send ("enableoutput" <$> oid) >> receive_
 
--- | Retrieve information for all output devices.
-outputs :: MonadMPD m => m [Device]
-outputs = getResponse "outputs" >>= runParser parseOutputs
+-- | Fold over a list of output devices.
+outputs :: MonadMPD m => (Output -> b -> m b) -> b -> m b
+outputs f acc =
+    send "outputs" >> receive >>= outputFold f acc
 
 --
 -- Reflection
 --
 
--- | Retrieve a list of available commands.
-commands :: MonadMPD m => m [String]
-commands = liftM takeValues (getResponse "commands")
+-- | Fold over a list of available commands.
+commands :: MonadMPD m => (B.ByteString -> b -> m b) -> b -> m b
+commands f acc =
+    send "commands" >> receive >>= elementNamedFold "command" f acc
 
--- | Retrieve a list of unavailable (due to access restrictions) commands.
-notCommands :: MonadMPD m => m [String]
-notCommands = liftM takeValues (getResponse "notcommands")
+-- | Fold over a list of unavailable (due to access restrictions) commands.
+notCommands :: MonadMPD m => (B.ByteString -> b -> m b) -> b -> m b
+notCommands f acc =
+    send "notcommands" >> receive >>= elementNamedFold "command" f acc
 
 -- | Retrieve a list of available song metadata.
-tagTypes :: MonadMPD m => m [String]
-tagTypes = liftM takeValues (getResponse "tagtypes")
+tagTypes :: MonadMPD m => (B.ByteString -> b -> m b) -> b -> m b
+tagTypes f acc =
+    send "tagtypes" >> receive >>= elementNamedFold "tagtype" f acc
 
--- | Retrieve a list of supported urlhandlers.
-urlHandlers :: MonadMPD m => m [String]
-urlHandlers = liftM takeValues (getResponse "urlhandlers")
+-- | Fold over a list of supported urlhandlers.
+urlHandlers :: MonadMPD m => (B.ByteString -> b -> m b) -> b -> m b
+urlHandlers f acc=
+    send "urlhandlers" >> receive >>= elementNamedFold "handler" f acc
 
--- | Retreive a list of decoder plugins with associated suffix and mime types.
-decoders :: MonadMPD m => m [(String, [(String, String)])]
-decoders = (takeDecoders . toAssocList) `liftM` getResponse "decoders"
-    where
-        takeDecoders [] = []
-        takeDecoders ((_, p):xs) =
-            let (info, rest) = break ((==) "plugin" . fst) xs
-            in (p, info) : takeDecoders rest
+-- | Fold over a list of decoder plugins with theirs suffixes and mime types.
+decoders :: MonadMPD m => (Decoder -> b -> m b) -> b -> m b
+decoders f acc =
+    send "decoders" >> receive >>= decoderFold f acc

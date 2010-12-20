@@ -55,6 +55,10 @@ instance (MPDArg a) => MPDArg (Maybe a) where
     prep Nothing = Args []
     prep (Just x) = prep x
 
+instance (MPDArg a, MPDArg b) => MPDArg (Either a b) where
+    prep (Left x)  = prep x
+    prep (Right y) = prep y
+
 instance (MPDArg a, MPDArg b) => MPDArg (a, b) where
     prep (x, y) = Args [show x ++ ":" ++ show y]
 

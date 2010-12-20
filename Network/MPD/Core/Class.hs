@@ -10,13 +10,13 @@
 
 module Network.MPD.Core.Class where
 
+import qualified Data.ByteString.Char8 as B
+
 import System.IO (Handle)
 
 import Network.MPD.Core.Error (MPDError)
 
 import Control.Monad.Error (MonadError)
-
-type Password = String
 
 -- | A typeclass to allow for multiple implementations of a connection
 --   to an MPD server.
@@ -25,13 +25,15 @@ class (Monad m, MonadError MPDError m) => MonadMPD m where
     open  :: m ()
     -- | Close the connection.
     close :: m ()
-    -- | Send a string to the server and return its response.
-    send  :: String -> m String
+    -- | Send a string to the server.
+    send  :: String -> m ()
+    -- | Get response from the server.
+    receive :: m [B.ByteString]
     -- | Get underlying Handle (or Nothing, if no connection is estabilished)
     getHandle :: m (Maybe Handle)
     -- | Produce a password to send to the server should it ask for
     --   one.
-    getPassword :: m Password
+    getPassword :: m String
     -- | Alters password to be sent to the server.
     setPassword :: String -> m ()
     -- | Get MPD protocol version

@@ -14,7 +14,7 @@ import Network.MPD.Commands.Arg
 import Network.MPD.Commands.Util
 
 import Control.Monad (liftM)
-
+{-
 -- | Like 'update', but returns the update job id.
 updateId :: MonadMPD m => [Path] -> m Integer
 updateId paths = liftM (read . head . takeValues) cmd
@@ -42,7 +42,7 @@ addMany plname xs = getResponses (map cmd xs) >> return ()
 -- | Delete a list of songs from a playlist.
 -- If there is a duplicate then no further songs will be deleted, so
 -- take care to avoid them (see 'prune' for this).
-{- deleteMany :: MonadMPD m => PlaylistName -> [PLIndex] -> m ()
+deleteMany :: MonadMPD m => PlaylistName -> [PLIndex] -> m ()
 deleteMany _ [] = return ()
 deleteMany plname [(Pos x)] = playlistDelete plname x
 deleteMany "" xs = getResponses (map cmd xs) >> return ()
@@ -114,7 +114,7 @@ lsFiles path =
 -- | List all playlists.
 lsPlaylists :: MonadMPD m => m [PlaylistName]
 lsPlaylists = liftM (extractEntries (const Nothing, Just, const Nothing)) $
-                    takeEntries =<< getResponse "lsinfo" -}
+                    takeEntries =<< getResponse "lsinfo"
 
 -- | List the artists in the database.
 listArtists :: MonadMPD m => m [Artist]
@@ -142,3 +142,4 @@ volume :: MonadMPD m => Int -> m ()
 volume n = do
     current <- (fromIntegral . stVolume) `liftM` status
     setVolume . round $ (fromIntegral n / 100) * current + current
+-}

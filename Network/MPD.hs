@@ -14,7 +14,6 @@
 module Network.MPD (
     -- * Basic data types
     MonadMPD, MPD, MPDError(..), ACKType(..), Response,
-    Host, Port, Password,
     -- * Connections
     withMPD, withMPDEx,
     module Network.MPD.Commands,
@@ -22,7 +21,7 @@ module Network.MPD (
 
 import Network.MPD.Commands
 import Network.MPD.Core
-import Network.MPD.Utils
+import Network.MPD.Utils (parseHost)
 
 import Control.Monad (liftM)
 import System.Environment (getEnv)
@@ -39,13 +38,10 @@ import System.IO.Error (isDoesNotExistError)
 -- > withMPD $ add_ "tool" >> play Nothing >> currentSong
 withMPD :: MPD a -> IO (Response a)
 withMPD m = do
-    port       <- read `liftM` getEnvDefault "MPD_PORT" "6600"
-    (host, pw) <- parseHost `liftM` getEnvDefault "MPD_HOST" "localhost"
+    port <- read `liftM` getEnvDefault "MPD_PORT" "6600"
+    (pw, host) <- getEnvDefault "MPD_HOST" "localhost" >>= return . parseHost
     withMPDEx host port pw m
     where
         getEnvDefault x dflt =
             catch (getEnv x) (\e -> if isDoesNotExistError e
                                     then return dflt else ioError e)
-        parseHost s = case breakChar '@' s of
-                          (host, "") -> (host, "")
-                          (pw, host) -> (host, pw)
