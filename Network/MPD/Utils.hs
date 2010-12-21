@@ -25,12 +25,15 @@ breakChar c s = second (B.drop 1) (B.break (== c) s)
 parseIso8601 :: (ParseTime t) => B.ByteString -> Maybe t
 parseIso8601 = parseTime defaultTimeLocale "%FT%TZ" . B.unpack
 
+-- | Splits host into (password, host) pair
 parseHost :: String -> (String, String)
 parseHost h =
     if '@' `elem` h
        then second (drop 1) $ break (=='@') h
        else ("", h)
 
+-- Parse numeric value, returning 'Nothing' on failure.
+parseNum :: (Read a) => String -> Maybe a
 parseNum s = do
     [(x, "")] <- return $ reads s
     return x

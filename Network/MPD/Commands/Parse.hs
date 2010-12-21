@@ -36,8 +36,9 @@ type Parser a = Maybe a -> (String, B.ByteString) -> (Maybe a, Iterate)
 type ObjFold a = (Monad m) => (a -> b -> m b) -> b -> [B.ByteString] -> m b
 type ObjGen a = (Monad m) => [B.ByteString] -> m (Maybe a)
 
+-- | Takes parser and produces fold over list of specified objects.
 parseResponse :: Parser a -> ObjFold a
-parseResponse parser f initial_acc ls = go Nothing ls initial_acc
+parseResponse parser f initial_acc list = go Nothing list initial_acc
     where
           go _   []         acc = return acc
           go obj ls@(l:ls') acc =
@@ -71,6 +72,7 @@ genOutput Nothing (k, v) =
          "outputid" -> (Just . initOutput . int $ v, Continue)
          _          -> (Nothing, Continue)
 
+initOutput :: Int -> Output
 initOutput id_ =
     Output { outID = id_
            , outName = B.empty
@@ -183,6 +185,7 @@ genSong s@(Just s') (k, v) =
           tagValue "MUSICBRAINZ_TRACKID" = Just MUSICBRAINZ_TRACKID
           tagValue _ = Nothing
 
+initSong :: B.ByteString -> Song
 initSong path =
     Song { sgFilePath = path
          , sgTags = M.empty
@@ -210,6 +213,7 @@ genPlaylist pl@(Just pl') (k, v) =
          "directory"     -> (pl, Stop)
          _               -> (pl, Continue)
 
+initPlaylist :: B.ByteString -> Playlist
 initPlaylist name =
     Playlist { plName = name
              , plLastModified = Nothing
@@ -339,6 +343,7 @@ genCount' c (k, v) =
     where
           c' = fromMaybe defaultCount c
 
+defaultCount :: Count
 defaultCount =
     Count { cSongs = -1, cPlaytime = -1 }
 
@@ -362,6 +367,7 @@ genStats' s (k, v) =
     where
           s' = fromMaybe defaultStats s
 
+defaultStats :: Stats
 defaultStats =
      Stats { stsArtists = -1, stsAlbums = -1, stsSongs = -1, stsUptime = -1
            , stsPlaytime = -1, stsDbPlaytime = -1, stsDbUpdate = -1 }
@@ -399,8 +405,6 @@ genStatus' s (k, v) =
     where
           s' = fromMaybe defaultStatus s
           
-          integer v = fromMaybe (-1) $ parseInteger v
-          frac v    = fromMaybe (read "NaN") $ parseFrac v
           audio     = fromMaybe (-1, -1, -1) $ parseTriple ':' parseInt v
           
           state =
@@ -414,6 +418,7 @@ genStatus' s (k, v) =
                    (Just a, Just b) -> (a, b)
                    _                -> (-1, -1)
 
+defaultStatus :: Status
 defaultStatus =
     Status { stState = Stopped, stVolume = -1, stRepeat = False
            , stRandom = False, stPlaylistID = -1, stPlaylistLength = -1
@@ -442,6 +447,14 @@ genReplayGainMode _ = Nothing
 -------------------------------------------------------------------
 
 -- | Helper conversion functions
-int v  = fromMaybe (-1)  $ parseInt v
+bool :: B.ByteString -> Bool
 bool v = fromMaybe False $ parseBool v
 
+frac :: (Read a, Fractional a) => B.ByteString -> a
+frac v = fromMaybe (0/0) $ parseFrac v
+
+int :: B.ByteString -> Int
+int v = fromMaybe (-1) $ parseInt v
+
+integer :: B.ByteString -> Integer
+integer v = fromMaybe (-1) $ parseInteger v
