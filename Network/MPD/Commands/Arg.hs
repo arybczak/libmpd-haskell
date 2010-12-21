@@ -8,7 +8,7 @@
 --
 -- Prepare command arguments.
 
-module Network.MPD.Commands.Arg (Args(..), MPDArg(..), (<++>), (<$>)) where
+module Network.MPD.Commands.Arg (Args(..), MPDArg(..), (<++>), (<@>)) where
 
 import Network.MPD.Utils (showBool)
 
@@ -39,9 +39,9 @@ x <++> y = Args $ xs ++ ys
 
 -- | Converts a command name and a string of arguments into the string
 -- to hand to getResponse.
-infix 2 <$>
-(<$>) :: (MPDArg a) => String -> a -> String
-x <$> y = x ++ " " ++ unwords (filter (not . null) y')
+infix 2 <@>
+(<@>) :: (MPDArg a) => String -> a -> String
+x <@> y = x ++ " " ++ unwords (filter (not . null) y')
     where Args y' = prep y
 
 instance MPDArg Args where prep = id
